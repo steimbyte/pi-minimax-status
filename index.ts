@@ -6,11 +6,15 @@
  * - Live status bar bottom-right (VanJS-style Unicode bars)
  * - Daily + Weekly usage tracking
  * - Configurable hex colors (amber/orange defaults)
- * - Only refreshes when session active (not idle)
+ * - Auto-detect credentials from env, .env, pi settings
+ * - Prompt user via UI if no credentials found
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Types
@@ -20,18 +24,18 @@ interface Config {
   apiKey: string;
   groupId: string;
   colors: {
-    bar: string;        // Default: #FFA500 (amber)
-    barWarning: string; // Default: #FF8C00 (dark orange)
-    barDanger: string;  // Default: #FF4500 (orange red)
-    text: string;       // Default: #FFB347 (light amber)
-    bg: string;         // Default: #1a1a1a (dark)
+    bar: string;
+    barWarning: string;
+    barDanger: string;
+    text: string;
+    bg: string;
   };
   thresholds: {
-    warning: number;    // Default: 60
-    danger: number;     // Default: 85
+    warning: number;
+    danger: number;
   };
-  refreshInterval: number; // Default: 60000 (1 minute)
-  barLength: number;       // Default: 10
+  refreshInterval: number;
+  barLength: number;
 }
 
 interface UsageSnapshot {
@@ -48,7 +52,7 @@ interface UsageData {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Config
+// Default Config
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const DEFAULT_CONFIG: Config = {
@@ -76,96 +80,187 @@ const DEFAULT_CONFIG: Config = {
 let config: Config = { ...DEFAULT_CONFIG };
 let currentUsage: { daily: number; weekly: number } = { daily: 0, weekly: 0 };
 let lastRefresh: number = 0;
-let refreshInterval: NodeJS.Timeout | null = null;
+let refreshInterval: ReturnType<typeof setInterval> | null = null;
 let extCtx: ExtensionContext | null = null;
+let isInitialized = false;
+let credentialsPrompted = false;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Config File Management
+// Paths
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function getConfigPath(): string {
-  const home = process.env.HOME || process.env.USERPROFILE || "~";
-  return `${home}/.config/pi-minimax-status/config.json`;
+function getConfigDir(): string {
+  return path.join(os.homedir(), ".config", "pi-minimax-status");
 }
 
-function loadConfig(): Config {
-  try {
-    const fs = require("fs");
-    const path = getConfigPath();
-    if (fs.existsSync(path)) {
-      const raw = fs.readFileSync(path, "utf-8");
-      const saved = JSON.parse(raw);
-      return {
-        ...DEFAULT_CONFIG,
-        ...saved,
-        colors: { ...DEFAULT_CONFIG.colors, ...saved.colors },
-        thresholds: { ...DEFAULT_CONFIG.thresholds, ...saved.thresholds },
-      };
+function getConfigPath(): string {
+  return path.join(getConfigDir(), "config.json");
+}
+
+function getUsagePath(): string {
+  return path.join(getConfigDir(), "usage.json");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Credential Detection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+interface DetectedCredentials {
+  apiKey: string;
+  groupId: string;
+}
+
+function detectCredentials(): DetectedCredentials | null {
+  // 1. Check environment variables
+  if (process.env.MINIMAX_API_KEY && process.env.MINIMAX_GROUP_ID) {
+    console.log("[minimax-status] Credentials from env vars");
+    return { apiKey: process.env.MINIMAX_API_KEY, groupId: process.env.MINIMAX_GROUP_ID };
+  }
+  if (process.env.MINIMAX_CODING_API_KEY && process.env.MINIMAX_GROUP_ID) {
+    console.log("[minimax-status] Credentials from env vars (MINIMAX_CODING_API_KEY)");
+    return { apiKey: process.env.MINIMAX_CODING_API_KEY, groupId: process.env.MINIMAX_GROUP_ID };
+  }
+
+  // 2. Check .env files
+  const envPaths = [
+    path.join(os.homedir(), ".env"),
+    path.join(os.homedir(), ".minimax", ".env"),
+    path.join(process.cwd(), ".env"),
+    path.join(os.homedir(), ".config", "minimax", ".env"),
+  ];
+
+  for (const envPath of envPaths) {
+    if (fs.existsSync(envPath)) {
+      const content = fs.readFileSync(envPath, "utf-8");
+      const apiKeyMatch = content.match(/MINIMAX[_]?[CODING]?[APIKEY]?=\s*(.+)/i);
+      const groupIdMatch = content.match(/MINIMAX[_]?GROUP[ID]?=\s*(.+)/i);
+      
+      if (apiKeyMatch && groupIdMatch) {
+        console.log("[minimax-status] Credentials from .env:", envPath);
+        return { apiKey: apiKeyMatch[1].trim(), groupId: groupIdMatch[1].trim() };
+      }
     }
+  }
+
+  // 3. Check pi settings.json
+  const piSettingsPath = path.join(os.homedir(), ".config", "opencode", "settings.json");
+  if (fs.existsSync(piSettingsPath)) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(piSettingsPath, "utf-8"));
+      if (settings.minimaxApiKey && settings.minimaxGroupId) {
+        console.log("[minimax-status] Credentials from pi settings");
+        return { apiKey: settings.minimaxApiKey, groupId: settings.minimaxGroupId };
+      }
+      if (settings.MINIMAX_API_KEY && settings.MINIMAX_GROUP_ID) {
+        console.log("[minimax-status] Credentials from pi settings");
+        return { apiKey: settings.MINIMAX_API_KEY, groupId: settings.MINIMAX_GROUP_ID };
+      }
+    } catch (e) {
+      // Ignore
+    }
+  }
+
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Config Management
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function loadConfig(): Config {
+  const cfgPath = getConfigPath();
+  
+  // Create default config if not exists
+  if (!fs.existsSync(cfgPath)) {
+    const cfgDir = getConfigDir();
+    if (!fs.existsSync(cfgDir)) {
+      fs.mkdirSync(cfgDir, { recursive: true });
+    }
+    
+    // Try auto-detect first
+    const detected = detectCredentials();
+    const cfg: Config = {
+      ...DEFAULT_CONFIG,
+      ...(detected ? { apiKey: detected.apiKey, groupId: detected.groupId } : {}),
+      colors: {
+        bar: "#FFA500",
+        barWarning: "#FF8C00",
+        barDanger: "#FF4500",
+        text: "#FFB347",
+        bg: "#1a1a1a",
+      },
+    };
+    
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+    return cfg;
+  }
+
+  try {
+    const raw = fs.readFileSync(cfgPath, "utf-8");
+    const saved = JSON.parse(raw);
+    
+    // Merge with defaults, prefer saved values
+    const merged: Config = {
+      ...DEFAULT_CONFIG,
+      ...saved,
+      colors: { ...DEFAULT_CONFIG.colors, ...saved.colors },
+      thresholds: { ...DEFAULT_CONFIG.thresholds, ...saved.thresholds },
+    };
+    
+    // If no credentials in config, try auto-detect
+    if (!merged.apiKey || !merged.groupId) {
+      const detected = detectCredentials();
+      if (detected) {
+        merged.apiKey = detected.apiKey;
+        merged.groupId = detected.groupId;
+        saveConfig(merged);
+      }
+    }
+    
+    return merged;
   } catch (e) {
-    // Use defaults
+    console.error("[minimax-status] Config load error:", e);
   }
   return { ...DEFAULT_CONFIG };
 }
 
-function saveConfig(): void {
+function saveConfig(cfg?: Config): void {
   try {
-    const fs = require("fs");
-    const path = getConfigPath();
-    const dir = require("path").dirname(path);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    const cfgDir = getConfigDir();
+    if (!fs.existsSync(cfgDir)) {
+      fs.mkdirSync(cfgDir, { recursive: true });
     }
-    fs.writeFileSync(path, JSON.stringify(config, null, 2));
+    fs.writeFileSync(getConfigPath(), JSON.stringify(cfg || config, null, 2));
   } catch (e) {
-    // Ignore
+    console.error("[minimax-status] Config save error:", e);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Usage Tracking (LocalStorage-like via file)
+// Usage Tracking
 // ═══════════════════════════════════════════════════════════════════════════════
-
-function getUsagePath(): string {
-  const home = process.env.HOME || process.env.USERPROFILE || "~";
-  return `${home}/.config/pi-minimax-status/usage.json`;
-}
 
 function loadUsageData(): UsageData {
   try {
-    const fs = require("fs");
-    const path = getUsagePath();
-    if (fs.existsSync(path)) {
-      return JSON.parse(fs.readFileSync(path, "utf-8"));
+    if (fs.existsSync(getUsagePath())) {
+      return JSON.parse(fs.readFileSync(getUsagePath(), "utf-8"));
     }
-  } catch (e) {
-    // Ignore
-  }
+  } catch (e) {}
   return { daily: [], weekly: [], lastFetch: 0 };
 }
 
 function saveUsageData(data: UsageData): void {
   try {
-    const fs = require("fs");
-    const path = getUsagePath();
-    const dir = require("path").dirname(path);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(path, JSON.stringify(data));
-  } catch (e) {
-    // Ignore
-  }
+    const dir = getConfigDir();
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(getUsagePath(), JSON.stringify(data));
+  } catch (e) {}
 }
 
 function pruneOldSnapshots(data: UsageData): void {
   const now = Date.now();
   const dayMs = 24 * 60 * 60 * 1000;
-
-  // Keep snapshots from last 7 days
   data.weekly = data.weekly.filter(s => now - s.timestamp < 7 * dayMs);
-  
-  // Keep snapshots from last 24 hours
   data.daily = data.daily.filter(s => now - s.timestamp < dayMs);
 }
 
@@ -173,14 +268,11 @@ function calculateUsage(): { daily: number; weekly: number } {
   const data = loadUsageData();
   pruneOldSnapshots(data);
 
-  // Get today's usage (sum of used counts from today's snapshots)
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
   const todayUsage = data.daily
     .filter(s => s.timestamp >= todayStart.getTime())
     .reduce((sum, s) => sum + s.used, 0);
-
-  // Get weekly usage (sum of all weekly snapshots)
   const weeklyUsage = data.weekly.reduce((sum, s) => sum + s.used, 0);
 
   return { daily: todayUsage, weekly: weeklyUsage };
@@ -188,17 +280,9 @@ function calculateUsage(): { daily: number; weekly: number } {
 
 function recordSnapshot(used: number, total: number, remains: number): void {
   const data = loadUsageData();
-  const snapshot: UsageSnapshot = {
-    timestamp: Date.now(),
-    used,
-    total,
-    remains,
-  };
-
-  data.daily.push(snapshot);
-  data.weekly.push(snapshot);
+  data.daily.push({ timestamp: Date.now(), used, total, remains });
+  data.weekly.push({ timestamp: Date.now(), used, total, remains });
   data.lastFetch = Date.now();
-
   pruneOldSnapshots(data);
   saveUsageData(data);
 }
@@ -214,7 +298,6 @@ async function fetchUsage(): Promise<{ used: number; total: number; remains: num
 
   try {
     const url = `https://platform.minimax.io/v1/api/openplatform/coding_plan/remains?GroupId=${config.groupId}`;
-    
     const response = await fetch(url, {
       headers: {
         "Authorization": `Bearer ${config.apiKey}`,
@@ -224,15 +307,9 @@ async function fetchUsage(): Promise<{ used: number; total: number; remains: num
       },
     });
 
-    if (!response.ok) {
-      return null;
-    }
-
+    if (!response.ok) return null;
     const json = await response.json();
-    
-    if (json.base_resp?.status_code !== 0) {
-      return null;
-    }
+    if (json.base_resp?.status_code !== 0) return null;
 
     const model = json.model_remains?.[0];
     if (!model) return null;
@@ -243,12 +320,13 @@ async function fetchUsage(): Promise<{ used: number; total: number; remains: num
       remains: model.remains_count || 0,
     };
   } catch (e) {
+    console.error("[minimax-status] Fetch error:", e);
     return null;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// UI Rendering (VanJS-style reactive)
+// UI Rendering
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function hexToAnsi(hex: string): string {
@@ -269,27 +347,49 @@ function getColor(percent: number): string {
 function renderBar(percent: number): string {
   const filled = Math.round((percent / 100) * config.barLength);
   const empty = config.barLength - filled;
-  const color = getColor(percent);
-  const colorAnsi = hexToAnsi(color);
-  
-  return `${colorAnsi}${"█".repeat(filled)}${"░".repeat(empty)}${RESET}`;
+  return `${hexToAnsi(getColor(percent))}${"█".repeat(filled)}${"░".repeat(empty)}${RESET}`;
 }
 
 function renderStatus(): string {
-  // Max expected usage per day/week (assume 1500 prompts for calculation)
   const maxDaily = 1500;
   const maxWeekly = 10000;
-
   const dailyPercent = Math.min(100, (currentUsage.daily / maxDaily) * 100);
   const weeklyPercent = Math.min(100, (currentUsage.weekly / maxWeekly) * 100);
 
-  const textColor = hexToAnsi(config.colors.text);
-  const bgColor = hexToAnsi(config.colors.bg);
+  return `${hexToAnsi(config.colors.bg)}${hexToAnsi(config.colors.text)}[D:${renderBar(dailyPercent)}${Math.round(dailyPercent)}%][W:${renderBar(weeklyPercent)}${Math.round(weeklyPercent)}%]${RESET}`;
+}
 
-  const dailyBar = renderBar(dailyPercent);
-  const weeklyBar = renderBar(weeklyPercent);
+function renderSetupStatus(): string {
+  return `${hexToAnsi(config.colors.barDanger)}[MiniMax: SETUP NEEDED]${RESET}`;
+}
 
-  return `${bgColor}${textColor}[D:${dailyBar}${Math.round(dailyPercent)}%][W:${weeklyBar}${Math.round(weeklyPercent)}%]${RESET}`;
+// ═══════════════════════════════════════════════════════════════════════════════
+// Setup Prompt
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function promptForCredentials(): Promise<boolean> {
+  if (!extCtx || credentialsPrompted) return false;
+  credentialsPrompted = true;
+
+  extCtx.ui.notify("MiniMax: Please enter your API Key and Group ID", "warning");
+  
+  try {
+    const apiKey = await extCtx.ui.input("MiniMax API Key", "Enter your MiniMax Coding Plan API Key");
+    if (!apiKey) return false;
+
+    const groupId = await extCtx.ui.input("MiniMax Group ID", "Enter your MiniMax Group ID");
+    if (!groupId) return false;
+
+    config.apiKey = apiKey;
+    config.groupId = groupId;
+    saveConfig();
+
+    extCtx.ui.notify("MiniMax credentials saved!", "success");
+    return true;
+  } catch (e) {
+    console.error("[minimax-status] Prompt error:", e);
+    return false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -297,14 +397,40 @@ function renderStatus(): string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export default async function (pi: ExtensionAPI): Promise<void> {
-  // Load config
+  console.log("[minimax-status] Loading...");
   config = loadConfig();
 
-  // Register config tool
+  // Show setup status if no credentials
+  pi.on("session_start", async (_event, ctx) => {
+    console.log("[minimax-status] Session started");
+    extCtx = ctx;
+    isInitialized = true;
+
+    // Check credentials
+    if (!config.apiKey || !config.groupId) {
+      updateStatus(); // Show setup needed
+      await promptForCredentials();
+    }
+
+    await refreshUsage();
+    startRefreshLoop();
+  });
+
+  pi.on("session_shutdown", () => {
+    stopRefreshLoop();
+    extCtx = null;
+    isInitialized = false;
+  });
+
+  pi.on("turn_start", () => {
+    if (isInitialized && extCtx) refreshUsage();
+  });
+
+  // Register tools
   pi.registerTool({
     name: "minimax_config",
     label: "MiniMax Config",
-    description: "Configure MiniMax status plugin",
+    description: "Configure MiniMax status",
     parameters: Type.Object({
       apiKey: Type.Optional(Type.String()),
       groupId: Type.Optional(Type.String()),
@@ -328,65 +454,40 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       if (params.thresholdWarning) config.thresholds.warning = params.thresholdWarning;
       if (params.thresholdDanger) config.thresholds.danger = params.thresholdDanger;
       if (params.barLength) config.barLength = params.barLength;
-
       saveConfig();
-      
-      // Refresh display
       updateStatus();
-
       return {
-        content: [{ type: "text", text: "MiniMax config updated. Status bar refreshed." }],
-        details: { config },
+        content: [{ type: "text", text: "Config updated." }],
       };
     },
   });
 
-  // Register refresh tool
   pi.registerTool({
     name: "minimax_refresh",
     label: "MiniMax Refresh",
-    description: "Manually refresh MiniMax usage data",
+    description: "Refresh usage data",
     parameters: Type.Object({}),
     async execute() {
       await refreshUsage();
       return {
-        content: [{ type: "text", text: `Usage refreshed: D=${currentUsage.daily}, W=${currentUsage.weekly}` }],
-        details: currentUsage,
+        content: [{ type: "text", text: `D=${currentUsage.daily}, W=${currentUsage.weekly}` }],
       };
     },
   });
 
-  // Event handlers
-  pi.on("session_start", async (_event, ctx) => {
-    extCtx = ctx;
-    startRefreshLoop();
-    await refreshUsage();
-  });
-
-  pi.on("session_shutdown", () => {
-    stopRefreshLoop();
-    extCtx = null;
-  });
-
-  pi.on("turn_start", () => {
-    // Session just became active - ensure refresh
-    if (!refreshInterval) {
-      startRefreshLoop();
-    }
-  });
-
-  // Register command for manual config
   pi.registerCommand("minimax", {
-    description: "MiniMax status - use minimax_config or minimax_refresh",
+    description: "MiniMax status",
     handler: async (args, ctx) => {
-      if (args === "status") {
-        await refreshUsage();
-        ctx.ui.notify(renderStatus(), "info");
+      if (args === "setup") {
+        credentialsPrompted = false;
+        await promptForCredentials();
       } else if (args === "refresh") {
         await refreshUsage();
-        ctx.ui.notify("Usage refreshed", "success");
+        ctx.ui.notify("Refreshed", "success");
+      } else if (args === "config") {
+        ctx.ui.notify(JSON.stringify(config, null, 2), "info");
       } else {
-        ctx.ui.notify("Commands: /minimax status | /minimax refresh", "info");
+        ctx.ui.notify("Commands: /minimax setup | refresh | config", "info");
       }
     },
   });
@@ -397,13 +498,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function refreshUsage(): Promise<void> {
+  if (!config.apiKey || !config.groupId) {
+    updateStatus();
+    return;
+  }
+
   const data = await fetchUsage();
-  
   if (data) {
     recordSnapshot(data.used, data.total, data.remains);
     currentUsage = calculateUsage();
   }
-  
   lastRefresh = Date.now();
   updateStatus();
 }
@@ -411,13 +515,15 @@ async function refreshUsage(): Promise<void> {
 function updateStatus(): void {
   if (!extCtx) return;
   
-  const status = renderStatus();
-  extCtx.ui.setStatus("minimax", status);
+  if (!config.apiKey || !config.groupId) {
+    extCtx.ui.setStatus("minimax", renderSetupStatus());
+  } else {
+    extCtx.ui.setStatus("minimax", renderStatus());
+  }
 }
 
 function startRefreshLoop(): void {
   if (refreshInterval) return;
-  
   refreshInterval = setInterval(async () => {
     if (extCtx && !extCtx.isIdle()) {
       await refreshUsage();
